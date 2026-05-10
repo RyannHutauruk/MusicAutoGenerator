@@ -127,7 +127,6 @@ export class SunoProvider implements MusicProvider {
 
   private async isLoggedIn(page: Page): Promise<boolean> {
     try {
-      // Suno's create page is now the home page
       await page.goto(SUNO_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
       await page.waitForTimeout(5000);
 
@@ -136,9 +135,10 @@ export class SunoProvider implements MusicProvider {
         return false;
       }
 
-      // Check for the chat/create textarea
-      const chatInput = await page.$('textarea[placeholder*="Chat"], textarea[placeholder*="music"], textarea[placeholder*="song"], textarea');
-      return chatInput !== null;
+      // Check for the chat/create textarea or credits indicator (logged-in indicators)
+      const hasTextarea = await page.$('textarea') !== null;
+      const hasCredits = await page.$('text=credits') !== null;
+      return hasTextarea || hasCredits;
     } catch {
       return false;
     }
@@ -183,21 +183,24 @@ export class SunoProvider implements MusicProvider {
     const page = await context.newPage();
 
     // Intercept audio download URLs from API responses
-    let capturedAudioUrls: string[] = [];
+    const capturedAudioUrls: string[] = [];
     page.on("response", async (response) => {
       const url = response.url();
-      if (url.includes("/api/feed") || url.includes("/api/gen") || url.includes("/api/clip")) {
+      // Match both studio-api-prod.suno.com and studio-api.prod.suno.com
+      if (url.includes("studio-api") && (url.includes("/api/feed") || url.includes("/api/gen") || url.includes("/api/clip") || url.includes("/api/session"))) {
         try {
-          const json = await response.json();
-          const clips = Array.isArray(json) ? json : json?.clips || json?.data || [];
+          const text = await response.text();
+          const json = JSON.parse(text);
+          // Handle different response shapes
+          const clips = json?.clips || json?.data || (Array.isArray(json) ? json : []);
           for (const clip of clips) {
             if (clip?.audio_url && clip?.status === "complete") {
               capturedAudioUrls.push(clip.audio_url);
-              logger.info(`Suno: captured audio URL from API response`);
+              logger.info(`Suno: captured completed audio URL from API`);
             }
           }
         } catch {
-          // Not JSON or no clips
+          // Not JSON or parsing failed
         }
       }
     });
@@ -223,41 +226,65 @@ export class SunoProvider implements MusicProvider {
       // Build the prompt
       let fullPrompt = options.prompt;
       if (options.mood) fullPrompt += `, ${options.mood}`;
-      if (options.instrumental !== false) fullPrompt += ", instrumental";
 
-      // Find the chat/create textarea (Suno's current UI uses "Chat to make music")
-      const promptInput = await page.$('textarea[placeholder*="Chat"], textarea[placeholder*="music"], textarea[placeholder*="song"], textarea');
-      if (!promptInput) {
-        logger.error("Suno: could not find prompt textarea");
-        // Take debug screenshot
+      // Step 1: Navigate directly to the Create workspace
+      logger.info("Suno: navigating to Create workspace...");
+      await page.goto("https://suno.com/create", { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(5000);
+
+      // Wait for Song Description textarea to appear
+      try {
+        await page.waitForSelector("textarea", { timeout: 15000 });
+      } catch {
+        logger.error("Suno: Create workspace textarea not found");
         await page.screenshot({ path: path.join(SESSIONS_DIR, `suno-debug-${Date.now()}.png`) });
         return null;
       }
 
-      await promptInput.click();
+      // Step 2: Fill Song Description using page-level actions (avoids stale element handles)
+      await page.click("textarea");
       await randomDelay(300, 600);
-      await promptInput.fill(fullPrompt);
+      await page.fill("textarea", fullPrompt);
+      await randomDelay(500, 1000);
+      logger.info(`Suno: filled Song Description with "${fullPrompt}"`);
+
+      // Step 3: Enable Instrumental mode if needed
+      if (options.instrumental !== false) {
+        try {
+          const instrumentalBtn = await page.$('button:has-text("Instrumental")');
+          if (instrumentalBtn) {
+            const ibox = await instrumentalBtn.boundingBox();
+            if (ibox) {
+              await page.mouse.click(ibox.x + ibox.width / 2, ibox.y + ibox.height / 2);
+            } else {
+              await instrumentalBtn.click({ force: true });
+            }
+            await randomDelay(300, 500);
+            logger.info("Suno: instrumental mode toggled");
+          }
+        } catch {
+          logger.warn("Suno: could not toggle instrumental mode");
+        }
+      }
+
+      // Step 4: Click the big Create button to start generation
+      // The workspace has a large gradient Create button at the bottom
       await randomDelay(500, 1000);
 
-      logger.info(`Suno: submitting prompt "${fullPrompt}"`);
+      // Find the large Create submit button and click using mouse coordinates
+      // (Suno has a div overlay that blocks element.click — must use page.mouse.click)
+      const workspaceBtns = await page.$$('button:has-text("Create")');
+      let submitClicked = false;
 
-      // Click Create button (the one near the textarea, not the nav one)
-      // Try multiple selectors for the create/submit button
-      let created = false;
-      const buttonSelectors = [
-        'button:has-text("Create"):near(textarea)',
-        'form button[type="submit"]',
-        'button:has-text("Create")',
-      ];
-
-      for (const sel of buttonSelectors) {
+      for (const btn of workspaceBtns) {
         try {
-          const btns = await page.$$(sel);
-          // Pick the last "Create" button (usually the one near the input)
-          const btn = btns.length > 1 ? btns[btns.length - 1] : btns[0];
-          if (btn) {
-            await btn.click();
-            created = true;
+          const box = await btn.boundingBox();
+          if (box && box.width > 150) {
+            const cx = box.x + box.width / 2;
+            const cy = box.y + box.height / 2;
+            await page.mouse.click(cx, cy);
+            submitClicked = true;
+            logger.info("Suno: clicked workspace Create button via mouse coordinates");
             break;
           }
         } catch {
@@ -265,10 +292,10 @@ export class SunoProvider implements MusicProvider {
         }
       }
 
-      // Fallback: press Enter to submit
-      if (!created) {
-        logger.info("Suno: trying Enter key to submit");
-        await promptInput.press("Enter");
+      if (!submitClicked) {
+        logger.error("Suno: could not find Create submit button");
+        await page.screenshot({ path: path.join(SESSIONS_DIR, `suno-no-create-${Date.now()}.png`) });
+        return null;
       }
 
       logger.info(`Suno: generating "${fullPrompt}" for ${options.genre}`);
@@ -337,18 +364,14 @@ export class SunoProvider implements MusicProvider {
         return capturedUrls[capturedUrls.length - 1];
       }
 
-      // Also check for audio elements in the DOM
+      // Check for audio elements in the DOM (filter out silence placeholder)
       const audioUrl = await page.evaluate(() => {
         const audios = document.querySelectorAll("audio source, audio");
         for (const a of audios) {
           const src = (a as HTMLAudioElement).src || (a as HTMLSourceElement).src;
-          if (src && (src.includes("cdn") || src.includes(".mp3") || src.includes("audio"))) return src;
-        }
-        // Check for download links
-        const links = document.querySelectorAll('a[href*="cdn"], a[download], a[href*=".mp3"]');
-        for (const l of links) {
-          const href = (l as HTMLAnchorElement).href;
-          if (href) return href;
+          if (src && src.includes("cdn") && !src.includes("sil-100") && !src.includes("silence")) {
+            return src;
+          }
         }
         return null;
       });
@@ -360,17 +383,20 @@ export class SunoProvider implements MusicProvider {
       // Check for error states
       const hasError = await page.evaluate(() => {
         const text = document.body.innerText.toLowerCase();
-        return text.includes("something went wrong") || text.includes("generation failed") || text.includes("out of credits");
+        return text.includes("something went wrong") || text.includes("generation failed") || text.includes("out of credits") || text.includes("insufficient credits");
       });
 
       if (hasError) {
         logger.warn("Suno: detected error state on page");
+        await page.screenshot({ path: path.join(SESSIONS_DIR, `suno-error-state-${Date.now()}.png`) }).catch(() => {});
         return null;
       }
 
       const elapsed = Math.round((Date.now() - startTime) / 1000);
-      if (elapsed % 30 === 0) {
+      if (elapsed % 30 === 0 && elapsed > 0) {
         logger.info(`Suno: waiting for generation... (${elapsed}s elapsed)`);
+        // Take periodic screenshots for debugging
+        await page.screenshot({ path: path.join(SESSIONS_DIR, `suno-wait-${elapsed}s.png`) }).catch(() => {});
       }
 
       await new Promise((r) => setTimeout(r, 5000));
