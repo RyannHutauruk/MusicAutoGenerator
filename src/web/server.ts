@@ -65,6 +65,17 @@ app.post("/api/generate", async (req, res) => {
   }
 
   orchestrator = new Orchestrator();
+
+  // Preflight check: ensure at least one account is configured
+  const config2 = loadConfig();
+  const hasSuno = config2.providers.suno.enabled && config2.providers.suno.accounts.length > 0;
+  const hasUdio = config2.providers.udio.enabled && config2.providers.udio.accounts.length > 0;
+  if (!hasSuno && !hasUdio) {
+    orchestrator = null;
+    res.status(400).json({ error: "No accounts configured. Add a Suno or Udio account first (scroll down to 'Add Account')." });
+    return;
+  }
+
   activeGeneration = {
     genre,
     promise: orchestrator
@@ -77,7 +88,6 @@ app.post("/api/generate", async (req, res) => {
       .catch((e) => {
         logger.error(`Web: generation failed — ${e}`);
         activeGeneration = null;
-        throw e;
       }),
   };
 
