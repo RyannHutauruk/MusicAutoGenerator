@@ -1,0 +1,37 @@
+{
+  "name": "music-generator",
+  "version": "1.0.0",
+  "description": "AI music generation automation tool — generates tracks from text prompts via Suno/Udio and organizes them into genre folders",
+  "main": "dist/index.js",
+  "bin": {
+    "music-gen": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "cli": "ts-node src/cli.ts",
+    "web": "ts-node src/web/server.ts",
+    "lint": "eslint src/**/*.ts"
+  },
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "commander": "^12.1.0",
+    "express": "^4.21.0",
+    "inquirer": "^8.2.6",
+    "playwright": "^1.48.0",
+    "better-sqlite3": "^11.6.0",
+    "winston": "^3.15.0",
+    "nanoid": "^3.3.7",
+    "sanitize-filename": "^1.6.3",
+    "glob": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/inquirer": "^9.0.7",
+    "@types/node": "^22.9.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
+  }
+}
