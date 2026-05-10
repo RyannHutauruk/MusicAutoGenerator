@@ -3,11 +3,16 @@
  *
  * Uses persistent browser sessions with saved cookies for authentication.
  * Supports multiple accounts with rotation and cooldown tracking.
+ *
+ * The Suno API blocks programmatic generation (token validation), so browser
+ * automation is the only reliable method for free-tier users.
  */
 
 import { chromium, Browser, BrowserContext, Page } from "playwright";
 import path from "path";
 import fs from "fs";
+import https from "https";
+import http from "http";
 import { nanoid } from "nanoid";
 import {
   MusicProvider,
@@ -26,10 +31,9 @@ import {
 
 const SESSIONS_DIR = path.resolve(process.cwd(), "sessions");
 const SUNO_URL = "https://suno.com";
-const SUNO_CREATE_URL = "https://suno.com/create";
 
-// Daily free tier limit per account
-const FREE_DAILY_LIMIT = 50; // credits (each song costs ~5 credits, so ~10 songs/day)
+// Free tier: 50 credits/day, each song costs ~5 credits = ~10 songs/day
+const FREE_DAILY_LIMIT = 50;
 
 export class SunoProvider implements MusicProvider {
   readonly name = "suno";
@@ -52,7 +56,7 @@ export class SunoProvider implements MusicProvider {
     fs.mkdirSync(SESSIONS_DIR, { recursive: true });
     this.browser = await chromium.launch({
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
     });
     logger.info("Suno: browser launched");
   }
@@ -79,7 +83,6 @@ export class SunoProvider implements MusicProvider {
     };
   }
 
-  /** Pick the next available account (round-robin with cooldown awareness). */
   private pickAccount(): ProviderAccount | null {
     const now = Date.now();
     const available = this.accounts
@@ -88,7 +91,6 @@ export class SunoProvider implements MusicProvider {
     return available.length > 0 ? available[0] : null;
   }
 
-  /** Get or create a browser context with persistent cookies for an account. */
   private async getContext(account: ProviderAccount): Promise<BrowserContext> {
     if (this.contexts.has(account.id)) {
       return this.contexts.get(account.id)!;
@@ -115,7 +117,6 @@ export class SunoProvider implements MusicProvider {
     return context;
   }
 
-  /** Save browser state (cookies, localStorage) for an account. */
   private async saveSession(account: ProviderAccount, context: BrowserContext): Promise<void> {
     const storagePath = path.join(SESSIONS_DIR, `suno-${account.id}`);
     const stateFile = path.join(storagePath, "state.json");
@@ -124,24 +125,25 @@ export class SunoProvider implements MusicProvider {
     logger.info(`Suno: saved session for account ${account.id}`);
   }
 
-  /** Check if we're logged into Suno. */
   private async isLoggedIn(page: Page): Promise<boolean> {
     try {
-      await page.goto(SUNO_CREATE_URL, { waitUntil: "networkidle", timeout: 30000 });
-      // If we're redirected to login or see sign-in button, not logged in
+      // Suno's create page is now the home page
+      await page.goto(SUNO_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(5000);
+
       const url = page.url();
-      if (url.includes("sign-in") || url.includes("login")) {
+      if (url.includes("sign-in") || url.includes("login") || url.includes("auth")) {
         return false;
       }
-      // Check for create button or textarea as indicator of logged-in state
-      const createArea = await page.$('textarea, [data-testid="create-input"], [placeholder*="song"]');
-      return createArea !== null;
+
+      // Check for the chat/create textarea
+      const chatInput = await page.$('textarea[placeholder*="Chat"], textarea[placeholder*="music"], textarea[placeholder*="song"], textarea');
+      return chatInput !== null;
     } catch {
       return false;
     }
   }
 
-  /** Login with cookie — user must provide their session cookie. */
   private async loginWithCookie(page: Page, account: ProviderAccount): Promise<boolean> {
     if (!account.cookiePath) {
       logger.warn(`Suno: no cookie path for account ${account.id}`);
@@ -150,7 +152,6 @@ export class SunoProvider implements MusicProvider {
 
     try {
       const cookieData = fs.readFileSync(account.cookiePath, "utf-8").trim();
-      // Set the __client cookie
       await page.context().addCookies([
         {
           name: "__client",
@@ -162,7 +163,8 @@ export class SunoProvider implements MusicProvider {
           sameSite: "Lax",
         },
       ]);
-      await page.goto(SUNO_CREATE_URL, { waitUntil: "networkidle", timeout: 30000 });
+      await page.goto(SUNO_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(5000);
       return await this.isLoggedIn(page);
     } catch (e) {
       logger.error(`Suno: cookie login failed for ${account.id}: ${e}`);
@@ -180,38 +182,55 @@ export class SunoProvider implements MusicProvider {
     const context = await this.getContext(account);
     const page = await context.newPage();
 
+    // Intercept audio download URLs from API responses
+    let capturedAudioUrls: string[] = [];
+    page.on("response", async (response) => {
+      const url = response.url();
+      if (url.includes("/api/feed") || url.includes("/api/gen") || url.includes("/api/clip")) {
+        try {
+          const json = await response.json();
+          const clips = Array.isArray(json) ? json : json?.clips || json?.data || [];
+          for (const clip of clips) {
+            if (clip?.audio_url && clip?.status === "complete") {
+              capturedAudioUrls.push(clip.audio_url);
+              logger.info(`Suno: captured audio URL from API response`);
+            }
+          }
+        } catch {
+          // Not JSON or no clips
+        }
+      }
+    });
+
     try {
       // Check login
-      const loggedIn = await this.isLoggedIn(page);
+      let loggedIn = await this.isLoggedIn(page);
       if (!loggedIn) {
         logger.info(`Suno: attempting cookie login for ${account.id}`);
-        const loginOk = await this.loginWithCookie(page, account);
-        if (!loginOk) {
+        loggedIn = await this.loginWithCookie(page, account);
+        if (!loggedIn) {
           logger.error(`Suno: login failed for ${account.id}`);
-          account.cooldownUntil = Date.now() + 3600000; // 1 hour cooldown
+          account.cooldownUntil = Date.now() + 3600000;
           return null;
         }
       }
 
       await this.saveSession(account, context);
-
-      // Navigate to create page
-      if (!page.url().includes("/create")) {
-        await page.goto(SUNO_CREATE_URL, { waitUntil: "networkidle", timeout: 30000 });
-      }
+      logger.info(`Suno: logged in as ${account.id}`);
 
       await randomDelay(1000, 2000);
 
-      // Build the prompt with mood/tags
+      // Build the prompt
       let fullPrompt = options.prompt;
       if (options.mood) fullPrompt += `, ${options.mood}`;
+      if (options.instrumental !== false) fullPrompt += ", instrumental";
 
-      // Look for the song description input and fill it
-      const promptInput = await page.$(
-        'textarea[placeholder*="song"], textarea[placeholder*="describe"], [data-testid="create-input"], textarea'
-      );
+      // Find the chat/create textarea (Suno's current UI uses "Chat to make music")
+      const promptInput = await page.$('textarea[placeholder*="Chat"], textarea[placeholder*="music"], textarea[placeholder*="song"], textarea');
       if (!promptInput) {
-        logger.error("Suno: could not find prompt input");
+        logger.error("Suno: could not find prompt textarea");
+        // Take debug screenshot
+        await page.screenshot({ path: path.join(SESSIONS_DIR, `suno-debug-${Date.now()}.png`) });
         return null;
       }
 
@@ -220,33 +239,46 @@ export class SunoProvider implements MusicProvider {
       await promptInput.fill(fullPrompt);
       await randomDelay(500, 1000);
 
-      // Toggle instrumental if needed
-      if (options.instrumental !== false) {
-        const instrumentalToggle = await page.$(
-          'button:has-text("Instrumental"), [aria-label*="nstrumental"], label:has-text("Instrumental")'
-        );
-        if (instrumentalToggle) {
-          await instrumentalToggle.click();
-          await randomDelay(300, 500);
+      logger.info(`Suno: submitting prompt "${fullPrompt}"`);
+
+      // Click Create button (the one near the textarea, not the nav one)
+      // Try multiple selectors for the create/submit button
+      let created = false;
+      const buttonSelectors = [
+        'button:has-text("Create"):near(textarea)',
+        'form button[type="submit"]',
+        'button:has-text("Create")',
+      ];
+
+      for (const sel of buttonSelectors) {
+        try {
+          const btns = await page.$$(sel);
+          // Pick the last "Create" button (usually the one near the input)
+          const btn = btns.length > 1 ? btns[btns.length - 1] : btns[0];
+          if (btn) {
+            await btn.click();
+            created = true;
+            break;
+          }
+        } catch {
+          continue;
         }
       }
 
-      // Click create/generate button
-      const createBtn = await page.$(
-        'button:has-text("Create"), button:has-text("Generate"), button[data-testid="create-button"]'
-      );
-      if (!createBtn) {
-        logger.error("Suno: could not find create button");
-        return null;
+      // Fallback: press Enter to submit
+      if (!created) {
+        logger.info("Suno: trying Enter key to submit");
+        await promptInput.press("Enter");
       }
 
-      await createBtn.click();
       logger.info(`Suno: generating "${fullPrompt}" for ${options.genre}`);
 
-      // Wait for generation to complete (poll for audio)
-      const trackUrl = await this.waitForTrack(page, 300000); // 5 min timeout
-      if (!trackUrl) {
+      // Wait for generation to complete
+      // Monitor both: intercepted API responses and page audio elements
+      const audioUrl = await this.waitForTrack(page, capturedAudioUrls, 300000);
+      if (!audioUrl) {
         logger.error("Suno: generation timed out or failed");
+        await page.screenshot({ path: path.join(SESSIONS_DIR, `suno-timeout-${Date.now()}.png`) });
         return null;
       }
 
@@ -255,12 +287,12 @@ export class SunoProvider implements MusicProvider {
       const filename = generateTrackFilename(options.genre);
       const filePath = path.join(genreFolder, filename);
 
-      await this.downloadTrack(trackUrl, filePath);
+      await this.downloadFile(audioUrl, filePath);
 
       // Update account stats
       account.lastUsed = Date.now();
       account.totalGenerated++;
-      account.dailyGenerated++;
+      account.dailyGenerated += 5; // Each song costs ~5 credits
 
       await this.saveSession(account, context);
 
@@ -275,7 +307,6 @@ export class SunoProvider implements MusicProvider {
         createdAt: new Date().toISOString(),
       };
 
-      // Save metadata
       saveMetadata(filePath, {
         prompt: fullPrompt,
         provider: this.name,
@@ -284,36 +315,40 @@ export class SunoProvider implements MusicProvider {
         genre: options.genre,
       });
 
-      logger.info(`Suno: generated ${filename} for ${options.genre}`);
+      const sizeMb = fs.existsSync(filePath) ? (fs.statSync(filePath).size / (1024 * 1024)).toFixed(2) : "?";
+      logger.info(`Suno: generated ${filename} (${sizeMb} MB) for ${options.genre}`);
       return result;
     } catch (e) {
       logger.error(`Suno: generation error — ${e}`);
+      await page.screenshot({ path: path.join(SESSIONS_DIR, `suno-error-${Date.now()}.png`) }).catch(() => {});
       return null;
     } finally {
       await page.close();
     }
   }
 
-  /** Wait for a generated track's audio URL to appear. */
-  private async waitForTrack(page: Page, timeoutMs: number): Promise<string | null> {
+  /** Wait for a generated track's audio URL — checks both API interception and DOM. */
+  private async waitForTrack(page: Page, capturedUrls: string[], timeoutMs: number): Promise<string | null> {
     const startTime = Date.now();
 
     while (Date.now() - startTime < timeoutMs) {
-      await randomDelay(5000, 8000);
+      // Check intercepted API responses first (most reliable)
+      if (capturedUrls.length > 0) {
+        return capturedUrls[capturedUrls.length - 1];
+      }
 
-      // Look for audio elements or download links
+      // Also check for audio elements in the DOM
       const audioUrl = await page.evaluate(() => {
-        // Check for audio elements
         const audios = document.querySelectorAll("audio source, audio");
         for (const a of audios) {
           const src = (a as HTMLAudioElement).src || (a as HTMLSourceElement).src;
-          if (src && src.includes("cdn")) return src;
+          if (src && (src.includes("cdn") || src.includes(".mp3") || src.includes("audio"))) return src;
         }
         // Check for download links
-        const links = document.querySelectorAll('a[href*="cdn"], a[download]');
+        const links = document.querySelectorAll('a[href*="cdn"], a[download], a[href*=".mp3"]');
         for (const l of links) {
           const href = (l as HTMLAnchorElement).href;
-          if (href && href.includes(".mp3")) return href;
+          if (href) return href;
         }
         return null;
       });
@@ -323,42 +358,49 @@ export class SunoProvider implements MusicProvider {
       }
 
       // Check for error states
-      const hasError = await page.$('text="error"');
+      const hasError = await page.evaluate(() => {
+        const text = document.body.innerText.toLowerCase();
+        return text.includes("something went wrong") || text.includes("generation failed") || text.includes("out of credits");
+      });
+
       if (hasError) {
         logger.warn("Suno: detected error state on page");
         return null;
       }
+
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
+      if (elapsed % 30 === 0) {
+        logger.info(`Suno: waiting for generation... (${elapsed}s elapsed)`);
+      }
+
+      await new Promise((r) => setTimeout(r, 5000));
     }
 
     return null;
   }
 
-  /** Download audio file from URL. */
-  private async downloadTrack(url: string, destPath: string): Promise<void> {
-    const { default: https } = await import("https");
-    const { default: http } = await import("http");
-
+  /** Download a file from URL, following redirects. */
+  private downloadFile(url: string, destPath: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      const client = url.startsWith("https") ? https : http;
-      const file = fs.createWriteStream(destPath);
-      client.get(url, (res) => {
-        if (res.statusCode === 302 || res.statusCode === 301) {
-          // Follow redirect
-          const redirectUrl = res.headers.location;
-          if (redirectUrl) {
-            const redirectClient = redirectUrl.startsWith("https") ? https : http;
-            redirectClient.get(redirectUrl, (res2) => {
-              res2.pipe(file);
-              file.on("finish", () => { file.close(); resolve(); });
-            }).on("error", reject);
-          } else {
-            reject(new Error("Redirect without location"));
+      const doGet = (downloadUrl: string, redirectCount: number = 0) => {
+        if (redirectCount > 5) { reject(new Error("Too many redirects")); return; }
+        const client = downloadUrl.startsWith("https") ? https : http;
+        client.get(downloadUrl, (res) => {
+          if (res.statusCode === 301 || res.statusCode === 302) {
+            if (res.headers.location) {
+              doGet(res.headers.location, redirectCount + 1);
+            } else {
+              reject(new Error("Redirect without location"));
+            }
+            return;
           }
-        } else {
+          const file = fs.createWriteStream(destPath);
           res.pipe(file);
           file.on("finish", () => { file.close(); resolve(); });
-        }
-      }).on("error", reject);
+          file.on("error", reject);
+        }).on("error", reject);
+      };
+      doGet(url);
     });
   }
 

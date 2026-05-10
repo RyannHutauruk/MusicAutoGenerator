@@ -9,7 +9,6 @@
 
 import { MusicProvider, ProviderAccount } from "../providers/provider-interface";
 import { SunoProvider } from "../providers/suno";
-import { SunoApiProvider } from "../providers/suno-api";
 import { UdioProvider } from "../providers/udio";
 import { GenerationQueue, QueueStats, QueueJob } from "../queue/queue";
 import { loadConfig, AppConfig } from "../storage/config";
@@ -38,36 +37,17 @@ export class Orchestrator {
   async init(): Promise<void> {
     if (this.initialized) return;
 
-    // Initialize Suno
+    // Initialize Suno (always browser mode — API blocks programmatic generation)
     if (this.config.providers.suno.enabled) {
       const sunoAccounts = this.config.providers.suno.accounts;
       if (sunoAccounts.length > 0) {
-        if (this.config.providers.suno.useApi) {
-          const sunoApi = new SunoApiProvider();
-          for (const acc of sunoAccounts) {
-            sunoApi.addAccount(this.resetDailyStats(acc));
-          }
-          await sunoApi.init();
-          if (await sunoApi.isReady()) {
-            this.providers.push(sunoApi);
-            logger.info("Orchestrator: Suno API provider ready");
-          } else {
-            logger.warn("Orchestrator: Suno API failed, trying browser mode");
-            const sunoBrowser = new SunoProvider();
-            for (const acc of sunoAccounts) {
-              sunoBrowser.addAccount(this.resetDailyStats(acc));
-            }
-            await sunoBrowser.init();
-            this.providers.push(sunoBrowser);
-          }
-        } else {
-          const suno = new SunoProvider();
-          for (const acc of sunoAccounts) {
-            suno.addAccount(this.resetDailyStats(acc));
-          }
-          await suno.init();
-          this.providers.push(suno);
+        const suno = new SunoProvider();
+        for (const acc of sunoAccounts) {
+          suno.addAccount(this.resetDailyStats(acc));
         }
+        await suno.init();
+        this.providers.push(suno);
+        logger.info("Orchestrator: Suno browser provider ready");
       }
     }
 
