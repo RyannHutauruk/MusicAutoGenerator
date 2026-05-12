@@ -87,7 +87,14 @@ export class SunoProvider implements MusicProvider {
     const now = Date.now();
     const available = this.accounts
       .filter((a) => (!a.cooldownUntil || a.cooldownUntil < now) && a.dailyGenerated < a.dailyLimit)
-      .sort((a, b) => (a.lastUsed || 0) - (b.lastUsed || 0));
+      .sort((a, b) => {
+        // Prefer session accounts over cookie accounts
+        const aSession = a.authType === "session" ? 0 : 1;
+        const bSession = b.authType === "session" ? 0 : 1;
+        if (aSession !== bSession) return aSession - bSession;
+        // Then sort by least recently used
+        return (a.lastUsed || 0) - (b.lastUsed || 0);
+      });
     return available.length > 0 ? available[0] : null;
   }
 
@@ -385,28 +392,59 @@ export class SunoProvider implements MusicProvider {
         }
       }
 
-      // Step 4: Click the big Create button to start generation
-      // The workspace has a large gradient Create button at the bottom
+      // Step 4: Click the Create button to start generation
       await randomDelay(500, 1000);
 
-      // Find the large Create submit button and click using mouse coordinates
+      // Find the Create button and click using mouse coordinates
       // (Suno has a div overlay that blocks element.click — must use page.mouse.click)
-      const workspaceBtns = await page.$$('button:has-text("Create")');
+      // Try multiple selectors in order of specificity
+      const createSelectors = [
+        'button:has-text("Create"):not(:has-text("Advanced"))',
+        'button:has(svg) :text("Create")',
+        '[role="button"]:has-text("Create")',
+      ];
+
       let submitClicked = false;
 
-      for (const btn of workspaceBtns) {
+      for (const selector of createSelectors) {
+        if (submitClicked) break;
         try {
-          const box = await btn.boundingBox();
-          if (box && box.width > 150) {
-            const cx = box.x + box.width / 2;
-            const cy = box.y + box.height / 2;
-            await page.mouse.click(cx, cy);
-            submitClicked = true;
-            logger.info("Suno: clicked workspace Create button via mouse coordinates");
-            break;
+          const btns = await page.$$(selector);
+          for (const btn of btns) {
+            const box = await btn.boundingBox();
+            if (box && box.width > 30 && box.height > 20) {
+              const cx = box.x + box.width / 2;
+              const cy = box.y + box.height / 2;
+              logger.info(`Suno: found Create button (${Math.round(box.width)}x${Math.round(box.height)} at ${Math.round(cx)},${Math.round(cy)})`);
+              await page.mouse.click(cx, cy);
+              submitClicked = true;
+              logger.info("Suno: clicked Create button via mouse coordinates");
+              break;
+            }
           }
         } catch {
           continue;
+        }
+      }
+
+      // Fallback: try clicking any element with exact "Create" text
+      if (!submitClicked) {
+        try {
+          const allBtns = await page.$$('button');
+          for (const btn of allBtns) {
+            const text = await btn.textContent();
+            if (text && text.trim() === "Create") {
+              const box = await btn.boundingBox();
+              if (box) {
+                await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+                submitClicked = true;
+                logger.info("Suno: clicked Create button via fallback text match");
+                break;
+              }
+            }
+          }
+        } catch {
+          logger.warn("Suno: fallback Create button search failed");
         }
       }
 
