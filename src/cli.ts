@@ -3,8 +3,9 @@
  * CLI interface for Music Generator.
  *
  * Usage:
+ *   npx ts-node src/cli.ts login --provider suno          (recommended: browser login)
  *   npx ts-node src/cli.ts generate --genre "lofi hip hop" --count 5
- *   npx ts-node src/cli.ts add-account --provider suno --cookie "..."
+ *   npx ts-node src/cli.ts add-account --provider suno --cookie "..."  (legacy)
  *   npx ts-node src/cli.ts status
  *   npx ts-node src/cli.ts interactive
  */
@@ -15,9 +16,10 @@ import chalk from "chalk";
 import fs from "fs";
 import path from "path";
 import { Orchestrator } from "./automation/orchestrator";
-import { addSunoAccount, addUdioAccount, loadConfig } from "./storage/config";
+import { addSunoAccount, addSunoSessionAccount, addUdioAccount, loadConfig, saveConfig } from "./storage/config";
 import { listGenres, countTracks } from "./utils/helpers";
 import { logger } from "./utils/logger";
+import { SunoProvider } from "./providers/suno";
 
 const program = new Command();
 
@@ -176,6 +178,57 @@ program
     }
   });
 
+// --- Login (interactive browser login) ---
+program
+  .command("login")
+  .description("Login to a provider via browser (no cookies needed)")
+  .requiredOption("--provider <provider>", "Provider name (suno)")
+  .option("--id <id>", "Account ID (auto-generated if not provided)")
+  .option("--email <email>", "Email label for this account")
+  .action(async (opts) => {
+    if (opts.provider !== "suno") {
+      console.error(chalk.red("Only 'suno' login is supported currently."));
+      return;
+    }
+
+    console.log(chalk.cyan.bold("\n🔑 Suno Interactive Login\n"));
+    console.log("A browser window will open. Log in with your Google account.");
+    console.log("The session will be saved for future automated use.\n");
+
+    const accountId = opts.id || `suno-${Date.now()}`;
+    const account = addSunoSessionAccount(accountId, opts.email);
+
+    const provider = new SunoProvider();
+    await provider.init();
+    provider.addAccount(account);
+
+    const success = await provider.loginInteractive(account);
+
+    if (success) {
+      // Update the config with the session path
+      const config = loadConfig();
+      const idx = config.providers.suno.accounts.findIndex((a) => a.id === account.id);
+      if (idx >= 0) {
+        config.providers.suno.accounts[idx] = account;
+        saveConfig(config);
+      }
+      console.log(chalk.green(`\nAccount ${account.id} logged in and saved!`));
+      console.log(chalk.gray(`Session: ${account.sessionPath}`));
+      console.log(chalk.gray(`Email: ${account.email || "unknown"}`));
+      console.log(chalk.yellow("\nYou can now run generation — the session will be reused automatically."));
+      console.log(chalk.yellow("Session lasts ~7-14 days. Run 'login' again when it expires.\n"));
+    } else {
+      console.error(chalk.red("\nLogin failed or timed out. Please try again.\n"));
+      // Remove the failed account from config
+      const config = loadConfig();
+      config.providers.suno.accounts = config.providers.suno.accounts.filter((a) => a.id !== account.id);
+      saveConfig(config);
+    }
+
+    await provider.destroy();
+    process.exit(0);
+  });
+
 // --- Status ---
 program
   .command("status")
@@ -186,9 +239,15 @@ program
 
     // Providers
     console.log(chalk.yellow("Providers:"));
+    const sunoAccounts = config.providers.suno.accounts;
+    const sessionCount = sunoAccounts.filter((a) => a.authType === "session").length;
+    const cookieCount = sunoAccounts.filter((a) => a.authType !== "session").length;
     console.log(
-      `  Suno: ${config.providers.suno.enabled ? chalk.green("enabled") : chalk.gray("disabled")} (${config.providers.suno.accounts.length} accounts, API mode: ${config.providers.suno.useApi ? "yes" : "no"})`
+      `  Suno: ${config.providers.suno.enabled ? chalk.green("enabled") : chalk.gray("disabled")} (${sunoAccounts.length} accounts: ${sessionCount} session, ${cookieCount} cookie)`
     );
+    for (const acc of sunoAccounts) {
+      console.log(`    - ${acc.id} (${acc.authType || "cookie"}) ${acc.email || ""} gen:${acc.dailyGenerated}/${acc.dailyLimit}`);
+    }
     console.log(
       `  Udio: ${config.providers.udio.enabled ? chalk.green("enabled") : chalk.gray("disabled")} (${config.providers.udio.accounts.length} accounts)`
     );

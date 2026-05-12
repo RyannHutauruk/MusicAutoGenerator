@@ -16,6 +16,10 @@ export interface ProviderAccount {
   provider: string;
   email?: string;
   cookiePath?: string;
+  /** Authentication type: 'cookie' (manual cookie paste) or 'session' (browser login, persistent) */
+  authType?: "cookie" | "session";
+  /** Path to saved Playwright browser state for session-based auth */
+  sessionPath?: string;
   lastUsed?: number;
   cooldownUntil?: number;
   totalGenerated: number;

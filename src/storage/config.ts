@@ -93,6 +93,32 @@ export function addSunoAccount(
   return account;
 }
 
+export function addSunoSessionAccount(
+  accountId?: string,
+  email?: string
+): ProviderAccount {
+  const config = loadConfig();
+  const id = accountId || `suno-${Date.now()}`;
+  const sessionsDir = path.resolve(process.cwd(), "sessions");
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  const sessionPath = path.join(sessionsDir, `${id}-state.json`);
+
+  const account: ProviderAccount = {
+    id,
+    provider: "suno",
+    email,
+    authType: "session",
+    sessionPath,
+    totalGenerated: 0,
+    dailyGenerated: 0,
+    dailyLimit: 50,
+  };
+
+  config.providers.suno.accounts.push(account);
+  saveConfig(config);
+  return account;
+}
+
 export function addUdioAccount(
   cookieOrPath: string,
   accountId?: string

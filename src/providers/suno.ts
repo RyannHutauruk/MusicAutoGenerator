@@ -96,14 +96,20 @@ export class SunoProvider implements MusicProvider {
       return this.contexts.get(account.id)!;
     }
 
-    const storagePath = path.join(SESSIONS_DIR, `suno-${account.id}`);
-    fs.mkdirSync(storagePath, { recursive: true });
-
-    const stateFile = path.join(storagePath, "state.json");
+    // For session-based auth, use the saved Playwright state file directly
     let storageState: string | undefined;
-    if (fs.existsSync(stateFile)) {
-      storageState = stateFile;
-      logger.info(`Suno: loading saved session for account ${account.id}`);
+    if (account.authType === "session" && account.sessionPath && fs.existsSync(account.sessionPath)) {
+      storageState = account.sessionPath;
+      logger.info(`Suno: loading saved login session for account ${account.id}`);
+    } else {
+      // Legacy: check the old session path
+      const storagePath = path.join(SESSIONS_DIR, `suno-${account.id}`);
+      fs.mkdirSync(storagePath, { recursive: true });
+      const stateFile = path.join(storagePath, "state.json");
+      if (fs.existsSync(stateFile)) {
+        storageState = stateFile;
+        logger.info(`Suno: loading saved session for account ${account.id}`);
+      }
     }
 
     const context = await this.browser!.newContext({
@@ -118,10 +124,20 @@ export class SunoProvider implements MusicProvider {
   }
 
   private async saveSession(account: ProviderAccount, context: BrowserContext): Promise<void> {
-    const storagePath = path.join(SESSIONS_DIR, `suno-${account.id}`);
-    const stateFile = path.join(storagePath, "state.json");
     const state = await context.storageState();
-    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+    const stateJson = JSON.stringify(state, null, 2);
+
+    // Save to session-based path if available
+    if (account.sessionPath) {
+      fs.mkdirSync(path.dirname(account.sessionPath), { recursive: true });
+      fs.writeFileSync(account.sessionPath, stateJson);
+    }
+
+    // Also save to legacy path for backwards compatibility
+    const storagePath = path.join(SESSIONS_DIR, `suno-${account.id}`);
+    fs.mkdirSync(storagePath, { recursive: true });
+    fs.writeFileSync(path.join(storagePath, "state.json"), stateJson);
+
     logger.info(`Suno: saved session for account ${account.id}`);
   }
 
@@ -172,6 +188,108 @@ export class SunoProvider implements MusicProvider {
     }
   }
 
+  /**
+   * Interactive login: opens a visible browser window for the user to log in manually.
+   * Saves the session state for future headless use.
+   * Returns true if login succeeded.
+   */
+  async loginInteractive(account: ProviderAccount): Promise<boolean> {
+    const sessionPath = account.sessionPath ||
+      path.join(SESSIONS_DIR, `${account.id}-state.json`);
+
+    logger.info(`Suno: opening browser for interactive login (account: ${account.id})`);
+    console.log("\n================================================");
+    console.log("  A browser window will open.");
+    console.log("  Please log in to Suno using your Google account.");
+    console.log("  The window will close automatically once logged in.");
+    console.log("  (or close it manually after logging in)");
+    console.log("================================================\n");
+
+    // Launch a HEADED (visible) browser for manual login
+    const headedBrowser = await chromium.launch({
+      headless: false,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
+
+    let storageState: string | undefined;
+    if (fs.existsSync(sessionPath)) {
+      storageState = sessionPath;
+    }
+
+    const context = await headedBrowser.newContext({
+      storageState: storageState as any,
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+      viewport: { width: 1280, height: 800 },
+    });
+
+    const page = await context.newPage();
+
+    try {
+      await page.goto(SUNO_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+      // Poll until user is logged in (check every 3 seconds for up to 5 minutes)
+      const maxWait = 300000;
+      const start = Date.now();
+      let loggedIn = false;
+
+      while (Date.now() - start < maxWait) {
+        await new Promise((r) => setTimeout(r, 3000));
+
+        try {
+          const url = page.url();
+          if (url.includes("sign-in") || url.includes("accounts.google.com")) {
+            continue; // Still in login flow
+          }
+
+          const hasCredits = await page.$('text=credits');
+          const hasTextarea = await page.$('textarea');
+          if (hasCredits || hasTextarea) {
+            loggedIn = true;
+            break;
+          }
+        } catch {
+          // Page might be navigating
+        }
+      }
+
+      if (loggedIn) {
+        // Save session state
+        const state = await context.storageState();
+        fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+        fs.writeFileSync(sessionPath, JSON.stringify(state, null, 2));
+        account.sessionPath = sessionPath;
+        account.authType = "session";
+
+        logger.info(`Suno: login successful! Session saved to ${sessionPath}`);
+        console.log("\n  Login successful! Session saved.");
+        console.log("  You can now close this browser window.\n");
+
+        // Try to get the email from the page
+        try {
+          const email = await page.evaluate(() => {
+            const text = document.body.innerText;
+            const match = text.match(/[\w.-]+@[\w.-]+\.\w+/);
+            return match ? match[0] : null;
+          });
+          if (email) account.email = email;
+        } catch {}
+
+        return true;
+      } else {
+        logger.warn("Suno: login timed out (5 minutes)");
+        console.log("\n  Login timed out. Please try again.\n");
+        return false;
+      }
+    } catch (e) {
+      logger.error(`Suno: interactive login error — ${e}`);
+      return false;
+    } finally {
+      await context.close();
+      await headedBrowser.close();
+    }
+  }
+
   async generate(options: GenerateOptions): Promise<TrackResult | null> {
     const account = this.pickAccount();
     if (!account) {
@@ -206,20 +324,20 @@ export class SunoProvider implements MusicProvider {
     });
 
     try {
-      // Check login
+      // Check login — session-based accounts have saved browser state
       let loggedIn = await this.isLoggedIn(page);
-      if (!loggedIn) {
+      if (!loggedIn && account.authType === "cookie") {
         logger.info(`Suno: attempting cookie login for ${account.id}`);
         loggedIn = await this.loginWithCookie(page, account);
-        if (!loggedIn) {
-          logger.error(`Suno: login failed for ${account.id}`);
-          account.cooldownUntil = Date.now() + 3600000;
-          return null;
-        }
+      }
+      if (!loggedIn) {
+        logger.error(`Suno: login failed for ${account.id} — ${account.authType === "session" ? "session expired, run 'login' command again" : "invalid cookie"}`);
+        account.cooldownUntil = Date.now() + 3600000;
+        return null;
       }
 
       await this.saveSession(account, context);
-      logger.info(`Suno: logged in as ${account.id}`);
+      logger.info(`Suno: logged in as ${account.id} (${account.authType || "cookie"} auth)`);
 
       await randomDelay(1000, 2000);
 

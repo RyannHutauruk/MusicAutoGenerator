@@ -36,6 +36,8 @@ app.get("/api/status", (_req, res) => {
       suno: {
         enabled: config.providers.suno.enabled,
         accounts: config.providers.suno.accounts.length,
+        sessionAccounts: config.providers.suno.accounts.filter((a) => a.authType === "session").length,
+        cookieAccounts: config.providers.suno.accounts.filter((a) => a.authType !== "session").length,
         useApi: config.providers.suno.useApi,
       },
       udio: {
@@ -251,9 +253,15 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   <div class="card">
     <h2>Add Account</h2>
+    <div style="margin-bottom:0.75rem;padding:0.75rem;background:#1a3a1a;border-radius:8px;font-size:0.85rem">
+      <strong>Recommended: Browser Login (no cookie needed)</strong><br>
+      Run in terminal: <code style="background:#333;padding:2px 6px;border-radius:4px">npx ts-node src/cli.ts login --provider suno</code><br>
+      A browser opens → log in with Google → session saved automatically.<br>
+      Add multiple accounts by running the command again with <code style="background:#333;padding:2px 6px;border-radius:4px">--email your@email.com</code>
+    </div>
     <div class="account-form">
       <select id="accProvider" style="flex:0 0 100px"><option value="suno">Suno</option><option value="udio">Udio</option></select>
-      <input id="accCookie" placeholder="Paste session cookie" type="password">
+      <input id="accCookie" placeholder="Or paste session cookie (legacy method)" type="password">
       <button class="btn-secondary" onclick="addAccount()">Add</button>
     </div>
     <div id="providerStatus" style="margin-top:0.5rem;font-size:0.85rem"></div>
