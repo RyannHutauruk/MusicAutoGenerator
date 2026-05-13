@@ -309,24 +309,59 @@ export class SunoProvider implements MusicProvider {
 
     // Intercept audio download URLs from API responses
     const capturedAudioUrls: string[] = [];
+    const seenClipIds: Set<string> = new Set();
     page.on("response", async (response) => {
       const url = response.url();
-      // Match both studio-api-prod.suno.com and studio-api.prod.suno.com
-      if (url.includes("studio-api") && (url.includes("/api/feed") || url.includes("/api/gen") || url.includes("/api/clip") || url.includes("/api/session"))) {
-        try {
-          const text = await response.text();
-          const json = JSON.parse(text);
-          // Handle different response shapes
-          const clips = json?.clips || json?.data || (Array.isArray(json) ? json : []);
-          for (const clip of clips) {
-            if (clip?.audio_url && clip?.status === "complete") {
-              capturedAudioUrls.push(clip.audio_url);
-              logger.info(`Suno: captured completed audio URL from API`);
+      const status = response.status();
+      // Broad match: any suno API response that might contain clip data
+      const isSunoApi = url.includes("suno.com/api") || url.includes("studio-api") || url.includes("clerk");
+      if (!isSunoApi || status !== 200) return;
+
+      try {
+        const contentType = response.headers()["content-type"] || "";
+        if (!contentType.includes("json")) return;
+
+        const text = await response.text();
+        const json = JSON.parse(text);
+
+        // Deep search for audio URLs in any JSON response shape
+        const searchForAudio = (obj: any): void => {
+          if (!obj || typeof obj !== "object") return;
+          if (Array.isArray(obj)) {
+            obj.forEach(searchForAudio);
+            return;
+          }
+          // Check if this object has an audio_url
+          if (obj.audio_url && typeof obj.audio_url === "string") {
+            const clipId = obj.id || obj.clip_id || "unknown";
+            const clipStatus = obj.status || "unknown";
+            if (!seenClipIds.has(clipId)) {
+              seenClipIds.add(clipId);
+              logger.info(`Suno: [API] clip ${clipId} status=${clipStatus} audio_url=${obj.audio_url ? "present" : "missing"}`);
+            }
+            if ((clipStatus === "complete" || clipStatus === "streaming") && !obj.audio_url.includes("sil-100")) {
+              capturedAudioUrls.push(obj.audio_url);
+              logger.info(`Suno: captured audio URL from API (status: ${clipStatus})`);
             }
           }
-        } catch {
-          // Not JSON or parsing failed
-        }
+          // Recurse into nested objects
+          for (const val of Object.values(obj)) {
+            if (typeof val === "object" && val !== null) {
+              searchForAudio(val);
+            }
+          }
+        };
+        searchForAudio(json);
+      } catch {
+        // Not JSON or parsing failed — ignore
+      }
+    });
+
+    // Also log key API requests for debugging
+    page.on("request", (request) => {
+      const url = request.url();
+      if ((url.includes("suno.com/api") || url.includes("studio-api")) && request.method() === "POST") {
+        logger.info(`Suno: [API] POST ${url.split("?")[0]}`);
       }
     });
 
@@ -454,6 +489,36 @@ export class SunoProvider implements MusicProvider {
         return null;
       }
 
+      // Wait a moment for the click to register, then verify generation started
+      await new Promise((r) => setTimeout(r, 3000));
+
+      // Check if a generation POST request was made (indicates click worked)
+      const postClickScreenshot = path.join(SESSIONS_DIR, `suno-post-click-${Date.now()}.png`);
+      await page.screenshot({ path: postClickScreenshot }).catch(() => {});
+
+      // Check if the page shows a generating/loading state
+      const generationStarted = await page.evaluate(() => {
+        const text = document.body.innerText.toLowerCase();
+        // Look for any loading indicators, progress bars, or new track cards appearing
+        const loadingIndicators = document.querySelectorAll('[class*="loading"], [class*="progress"], [class*="generating"], [class*="spinner"]');
+        const hasLoadingText = text.includes("generating") || text.includes("creating");
+        return loadingIndicators.length > 0 || hasLoadingText;
+      });
+
+      if (generationStarted) {
+        logger.info("Suno: generation started (loading indicator detected)");
+      } else {
+        logger.warn("Suno: no loading indicator detected after click — generation may not have started, retrying click...");
+        // Try clicking the Create button again with page.click()
+        try {
+          await page.click('button:has-text("Create")', { timeout: 5000, force: true });
+          logger.info("Suno: retried Create button click via page.click()");
+        } catch {
+          logger.warn("Suno: retry click failed — continuing to wait anyway");
+        }
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+
       logger.info(`Suno: generating "${fullPrompt}" for ${options.genre}`);
 
       // Wait for generation to complete
@@ -510,7 +575,7 @@ export class SunoProvider implements MusicProvider {
     }
   }
 
-  /** Wait for a generated track's audio URL — checks both API interception and DOM. */
+  /** Wait for a generated track's audio URL — checks API interception, DOM audio, and track cards. */
   private async waitForTrack(page: Page, capturedUrls: string[], timeoutMs: number): Promise<string | null> {
     const startTime = Date.now();
 
@@ -520,20 +585,118 @@ export class SunoProvider implements MusicProvider {
         return capturedUrls[capturedUrls.length - 1];
       }
 
-      // Check for audio elements in the DOM (filter out silence placeholder)
-      const audioUrl = await page.evaluate(() => {
-        const audios = document.querySelectorAll("audio source, audio");
-        for (const a of audios) {
-          const src = (a as HTMLAudioElement).src || (a as HTMLSourceElement).src;
-          if (src && src.includes("cdn") && !src.includes("sil-100") && !src.includes("silence")) {
+      // Check for audio/video elements and CDN links in the DOM
+      const mediaUrl = await page.evaluate(() => {
+        // Check <audio> and <video> elements
+        const mediaEls = document.querySelectorAll("audio source, audio, video source, video");
+        for (const a of mediaEls) {
+          const src = (a as HTMLMediaElement).src || (a as HTMLSourceElement).src;
+          if (src && (src.includes("cdn1.suno.ai") || src.includes("cdn2.suno.ai")) && !src.includes("sil-100") && !src.includes("silence")) {
+            return src;
+          }
+        }
+        // Check <a> download links
+        const links = document.querySelectorAll('a[href*="cdn1.suno.ai"], a[href*="cdn2.suno.ai"], a[download]');
+        for (const link of links) {
+          const href = (link as HTMLAnchorElement).href;
+          if (href && (href.endsWith(".mp3") || href.endsWith(".wav")) && !href.includes("sil-100")) {
+            return href;
+          }
+        }
+        // Check for any element with a CDN audio URL in data attributes or style
+        const allCdn = document.querySelectorAll('[src*="cdn1.suno.ai"], [src*="cdn2.suno.ai"]');
+        for (const el of allCdn) {
+          const src = (el as HTMLImageElement).src;
+          if (src && (src.endsWith(".mp3") || src.endsWith(".wav"))) {
             return src;
           }
         }
         return null;
       });
 
-      if (audioUrl) {
-        return audioUrl;
+      if (mediaUrl) {
+        logger.info(`Suno: found media URL in DOM: ${mediaUrl.substring(0, 80)}...`);
+        return mediaUrl;
+      }
+
+      // Check for completed track cards in chat interface
+      const trackReady = await page.evaluate(() => {
+        // Look for play buttons or track duration indicators that appear when generation is done
+        const playBtns = document.querySelectorAll('button[aria-label*="play" i], button[aria-label*="Play" i]');
+        // Look for track time displays (e.g. "0:00 / 2:30")
+        const timeDisplays = Array.from(document.querySelectorAll('span, div, p')).filter(el => {
+          const t = el.textContent || '';
+          return /\d+:\d+\s*\/\s*\d+:\d+/.test(t) && !t.includes("credits");
+        });
+        return playBtns.length > 0 || timeDisplays.length > 0;
+      });
+
+      if (trackReady) {
+        logger.info("Suno: track card detected in UI, polling API for audio URL...");
+        // Track is visible but we haven't captured the URL yet — keep polling API interception
+        // The URL should appear soon in the API responses
+        await new Promise((r) => setTimeout(r, 3000));
+        if (capturedUrls.length > 0) {
+          return capturedUrls[capturedUrls.length - 1];
+        }
+        // Try extracting from page context (look for audio player state)
+        const extractedUrl = await page.evaluate(() => {
+          // Some SPAs store audio state in React/Next.js internals
+          const audioEls = document.querySelectorAll('audio');
+          for (const a of audioEls) {
+            if (a.src && a.src.includes("cdn") && !a.src.includes("sil-100")) return a.src;
+            // Check child sources
+            for (const s of a.querySelectorAll('source')) {
+              if (s.src && s.src.includes("cdn") && !s.src.includes("sil-100")) return s.src;
+            }
+          }
+          return null;
+        });
+        if (extractedUrl) return extractedUrl;
+      }
+
+      // Direct API poll: fetch the user's latest clips from Suno API via page context
+      // This is more reliable than passive interception since we actively request the data
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
+      if (elapsed >= 15 && elapsed % 10 === 0) {
+        try {
+          const apiResult = await page.evaluate(async () => {
+            // Try multiple API endpoints to find completed clips
+            const endpoints = [
+              "https://studio-api.suno.ai/api/feed/?page=0&page_size=4",
+              "https://studio-api-prod.suno.com/api/feed/?page=0&page_size=4",
+              "https://suno.com/api/feed/?page=0&page_size=4",
+            ];
+            for (const endpoint of endpoints) {
+              try {
+                const res = await fetch(endpoint, { credentials: "include" });
+                if (!res.ok) continue;
+                const data = await res.json();
+                const clips = data?.clips || data?.data || (Array.isArray(data) ? data : []);
+                for (const clip of clips) {
+                  if (clip?.audio_url && (clip?.status === "complete" || clip?.status === "streaming")) {
+                    // Check if this clip was created recently (within last 10 minutes)
+                    const createdAt = clip.created_at ? new Date(clip.created_at).getTime() : 0;
+                    const now = Date.now();
+                    if (now - createdAt < 600000) {
+                      return { url: clip.audio_url, status: clip.status, id: clip.id, endpoint };
+                    }
+                  }
+                }
+              } catch {
+                // Endpoint not available
+              }
+            }
+            return null;
+          });
+
+          if (apiResult) {
+            logger.info(`Suno: [API poll] found clip ${apiResult.id} (${apiResult.status}) via ${apiResult.endpoint}`);
+            return apiResult.url;
+          }
+        } catch {
+          // API poll failed — not critical
+        }
       }
 
       // Check for error states
@@ -548,10 +711,8 @@ export class SunoProvider implements MusicProvider {
         return null;
       }
 
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
       if (elapsed % 30 === 0 && elapsed > 0) {
         logger.info(`Suno: waiting for generation... (${elapsed}s elapsed)`);
-        // Take periodic screenshots for debugging
         await page.screenshot({ path: path.join(SESSIONS_DIR, `suno-wait-${elapsed}s.png`) }).catch(() => {});
       }
 
